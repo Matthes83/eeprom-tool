@@ -47,70 +47,55 @@ class EEPROM:
         self.s.write(f"S {size} {page} {addrbytes}\n".encode())
         return self.s.readline().decode(errors="replace").strip()
 
-    def _read_at(self, addr, size, page, addrbytes):
-        """Liest 1 Byte ueber temporaere Chip-Konfig (fuer Probe)."""
-        self.set_chip(size, page, addrbytes)
-        self.s.reset_input_buffer()
-        # kompletter Dump waere langsam -> wir nutzen R nur fuer 1 Byte-Faelle
-        # Stattdessen: Mini-Dump durch Setzen size=addr+1 ist unsauber.
-        # Einfacher: ganzer Dump, aber nur fuer kleine Testgroessen verwendet.
-        self.s.write(b"R")
-        data = self.s.read(size)
-        return data
-
     def autodetect(self):
         """
-        Wrap-Around-Erkennung. Strategie:
-        Fuer jeden Kandidaten von gross nach klein einen vollstaendigen Dump
-        ziehen und pruefen, ob sich der Inhalt ab Kandidatengroesse exakt
-        wiederholt (Spiegelung durch Adress-Wrap). Die kleinste Groesse,
-        bei der KEINE Spiegelung mehr auftritt, ist die echte Groesse.
+        Auto-Erkennung ueber den firmwareseitigen 'D'-Befehl.
+
+        Die Firmware ermittelt hardwarenah:
+          1. Adressbreite (1 vs 2 Byte) durch Vergleich von Byte 0 in
+             beiden Modi - ein kleiner Chip liefert im 2-Byte-Modus Murks.
+          2. Groesse durch zerstoerungsfreien Wrap-Around-Test (Marker
+             schreiben, auf Adresse 0 pruefen, Original zuruecksichern).
+
+        Das ist zuverlaessiger als eine reine Spiegelungs-Heuristik und
+        funktioniert auch bei leeren Chips.
 
         Liefert (name, size, page, addrbytes) oder None.
         """
-        self.log("Auto-Erkennung laeuft ...")
-        # Wir lesen einmal mit der groessten plausiblen Konfig je Adressmodus
-        # und analysieren die Spiegelung.
-        best = None
-        for addrbytes in (2, 1):
-            # groesster Chip dieses Adressmodus
-            cands = [(n, sz, pg, ab) for n, (sz, pg, ab) in CHIPS.items()
-                     if ab == addrbytes]
-            if not cands:
-                continue
-            maxsize = max(c[1] for c in cands)
-            self.set_chip(maxsize, 8, addrbytes)
-            self.s.reset_input_buffer()
-            self.s.write(b"R")
-            data = self.s.read(maxsize)
-            if len(data) != maxsize:
-                self.log(f"  addrbytes={addrbytes}: Lesefehler "
-                         f"({len(data)}/{maxsize})")
-                continue
+        self.log("Auto-Erkennung laeuft (Firmware-Detect) ...")
+        self.s.reset_input_buffer()
+        self.s.write(b"D")
+        # Detect kann durch die Schreibzyklen einen Moment dauern
+        line = self.s.readline().decode(errors="replace").strip()
+        if not line.startswith("DETECT"):
+            self.log(f"Unerwartete Antwort: {line!r}")
+            return None
 
-            # Finde kleinste Periode, die ein echter Chip-Typ ist
-            for n, sz, pg, ab in sorted(cands, key=lambda c: c[1]):
-                if sz > maxsize:
-                    continue
-                block = data[:sz]
-                mirrored = all(
-                    data[i:i + sz] == block
-                    for i in range(sz, maxsize, sz)
-                )
-                if mirrored:
-                    self.log(f"  Kandidat {n}: Inhalt spiegelt sich -> "
-                             f"Groesse <= {sz}")
-                    best = (n, sz, pg, ab)
-                    break
-            if best:
-                break
+        # Format: "DETECT size=256 addrbytes=1 page=8"
+        size = addrbytes = page = None
+        for tok in line.split():
+            if tok.startswith("size="):
+                size = int(tok[5:])
+            elif tok.startswith("addrbytes="):
+                addrbytes = int(tok[10:])
+            elif tok.startswith("page="):
+                page = int(tok[5:])
 
-        if best:
-            self.log(f"Erkannt: {best[0]} "
-                     f"({best[1]} Bytes, {best[3]} Adressbyte(s))")
-        else:
-            self.log("Keine sichere Erkennung - bitte manuell waehlen.")
-        return best
+        if size is None or addrbytes is None:
+            self.log(f"Konnte Antwort nicht parsen: {line!r}")
+            return None
+
+        # passenden bekannten Chip-Namen suchen
+        name = next((n for n, (sz, pg, ab) in CHIPS.items()
+                     if sz == size and ab == addrbytes), None)
+        if name is None:
+            self.log(f"Erkannt: {size} Bytes, {addrbytes} Adressbyte(s) "
+                     f"- kein Standardtyp, bitte pruefen.")
+            return None
+
+        self.log(f"Erkannt: {name} ({size} Bytes, "
+                 f"{addrbytes} Adressbyte(s))")
+        return (name, size, page or CHIPS[name][1], addrbytes)
 
     def read_dump(self, size, page, addrbytes):
         self.set_chip(size, page, addrbytes)
@@ -126,10 +111,60 @@ class EEPROM:
             raise ValueError(f"Datei {len(data)} Bytes, Chip {size} Bytes")
         self.set_chip(size, page, addrbytes)
         self.s.reset_input_buffer()
+        # Handshake: W senden, auf READY der Firmware warten, DANN Daten.
+        # Das verhindert, dass alte Kommando-Bytes in die Daten geraten.
         self.s.write(b"W")
-        self.s.write(data)
         self.s.flush()
-        return self.s.readline().decode(errors="replace").strip()
+        ready = self.s.readline().decode(errors="replace").strip()
+        if ready != "READY":
+            raise IOError(f"Kein READY von der Firmware (bekam: {ready!r})")
+        # Jetzt die Datenbytes senden - flussgesteuert in 32-Byte-Bloecken.
+        # Nach jedem Block wartet die GUI auf '.' der Firmware, bevor sie
+        # weiterschickt. Verhindert Ueberlauf des 64-Byte-Arduino-Puffers.
+        BLOCK = 32
+        old_to = self.s.timeout
+        self.s.timeout = max(old_to or 5, 15)
+        try:
+            sent = 0
+            while sent < size:
+                chunk = data[sent:sent + BLOCK]
+                self.s.write(chunk)
+                self.s.flush()
+                ack = self.s.read(1)   # auf '.' warten
+                if ack != b".":
+                    # koennte schon die Schlussmeldung sein
+                    rest = self.s.readline().decode(errors="replace")
+                    full = (ack.decode(errors="replace") + rest).strip()
+                    if full.startswith("TIMEOUT"):
+                        raise IOError(
+                            f"Firmware bekam nicht alle Bytes: {full}. "
+                            f"Pruefe uC-Reset und WP-Pin.")
+                    raise IOError(f"Block-Quittung fehlt (bekam: {full!r})")
+                sent += len(chunk)
+            # alle Bloecke bestaetigt -> Schlussmeldung lesen
+            resp = self.s.readline().decode(errors="replace").strip()
+        finally:
+            self.s.timeout = old_to
+        # Firmware meldet "OK <anzahl>" oder "TIMEOUT bei Byte <n>"
+        if resp.startswith("TIMEOUT"):
+            raise IOError(
+                f"Firmware bekam nicht alle Bytes: {resp}. "
+                f"Pruefe uC-Reset und WP-Pin.")
+        if not resp.startswith("OK"):
+            raise IOError(f"Schreiben nicht bestaetigt (bekam: {resp!r})")
+
+        # Verify: komplett zuruecklesen und vergleichen
+        readback = self.read_dump(size, page, addrbytes)
+        if readback != data:
+            # erste Abweichung finden fuer eine hilfreiche Meldung
+            for i in range(size):
+                if readback[i] != data[i]:
+                    raise IOError(
+                        f"Verify fehlgeschlagen ab Adresse 0x{i:02X}: "
+                        f"geschrieben 0x{data[i]:02X}, "
+                        f"gelesen 0x{readback[i]:02X}")
+            raise IOError("Verify fehlgeschlagen (Laengen-Differenz)")
+        return f"{resp} - verifiziert OK"
 
 
 def hexdump(data, width=16, limit=4096):
@@ -324,3 +359,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+

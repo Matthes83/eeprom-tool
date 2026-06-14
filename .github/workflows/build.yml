@@ -1,0 +1,77 @@
+name: Build
+
+# Baut die Anwendung fuer Windows und macOS.
+# Loest aus bei Push auf main und bei jedem Tag v*.
+# Bei einem Tag (z.B. v1.0.0) werden die Builds zusaetzlich als
+# GitHub-Release veroeffentlicht.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:        # erlaubt manuelles Starten ueber die Actions-UI
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: EEPROM-Tool-Windows
+            path: dist/EEPROM-Tool.exe
+          - os: macos-latest
+            artifact: EEPROM-Tool-macOS
+            path: dist/EEPROM-Tool.app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build
+        run: pyinstaller --clean --noconfirm eeprom.spec
+
+      - name: macOS App zippen
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r EEPROM-Tool-macOS.zip EEPROM-Tool.app
+          cd ..
+
+      - name: Artefakt hochladen (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/EEPROM-Tool.exe
+
+      - name: Artefakt hochladen (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/EEPROM-Tool-macOS.zip
+
+      - name: Release-Datei anhaengen (Windows)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EEPROM-Tool.exe
+
+      - name: Release-Datei anhaengen (macOS)
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EEPROM-Tool-macOS.zip
